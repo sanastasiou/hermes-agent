@@ -4130,6 +4130,25 @@ OPTIONAL_ENV_VARS = {
         "category": "tool",
         "advanced": True,
     },
+    "HASS_ENTITY_DENYLIST": {
+        "description": "Comma-separated entity_id prefixes or globs that ha_list_entities always "
+                       "excludes (e.g. 'office_thermostat_*' to hide a zombie entity cluster left "
+                       "behind by a migration). Lets you prune known-dead entities without editing code.",
+        "prompt": "Home Assistant entity denylist (comma-separated, e.g. office_thermostat_*)",
+        "url": None,
+        "password": False,
+        "category": "tool",
+        "advanced": True,
+    },
+    "HASS_ENTITY_ALLOWLIST": {
+        "description": "Comma-separated entity_id prefixes or globs that ha_list_entities is limited "
+                       "to (a whitelist). HASS_ENTITY_DENYLIST still acts as a final veto on top of it.",
+        "prompt": "Home Assistant entity allowlist (comma-separated, e.g. climate.*, sensor.office_*)",
+        "url": None,
+        "password": False,
+        "category": "tool",
+        "advanced": True,
+    },
     "TOOL_GATEWAY_USER_TOKEN": {
         "description": "Explicit Nous Subscriber access token for tool-gateway requests (optional; otherwise read from the Hermes auth store)",
         "prompt": "Tool-gateway user token",
