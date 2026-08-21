@@ -20,6 +20,7 @@ from tools.homeassistant_tool import (
     _parse_entity_filter_patterns,
     _entity_matches,
     _apply_operator_filters,
+    _operator_filter_violation,
     _handle_get_state,
     _handle_call_service,
     _handle_list_entities,
@@ -586,3 +587,78 @@ class TestOperatorAllowDeny:
         assert _entity_matches("office_thermostat.0", ["office_thermostat.0"])
         assert _entity_matches("office_thermostat.0", ["office_thermostat."])
         assert not _entity_matches("sensor.other", ["office_thermostat.*"])
+
+
+# ---------------------------------------------------------------------------
+# Single-entity read path (ha_get_state) honors the operator allow/deny lists
+# ---------------------------------------------------------------------------
+
+
+class TestGetStateOperatorFilters:
+    """A denylisted zombie must not be readable via ha_get_state either."""
+
+    def test_denylisted_entity_is_refused_with_clear_error(self, monkeypatch):
+        _reset_filter_mirrors(monkeypatch)
+        monkeypatch.setenv("HASS_ENTITY_DENYLIST", "office_thermostat_*")
+        # Refused BEFORE any network call — _run_async must not be reached.
+        with patch.object(ha_tool, "_run_async") as run:
+            result = json.loads(_handle_get_state(
+                {"entity_id": "office_thermostat.0_external_temperature"}
+            ))
+        assert "error" in result
+        assert "operator config" in result["error"]
+        assert "HASS_ENTITY_DENYLIST" in result["error"]
+        run.assert_not_called()
+
+    def test_allowlist_blocks_non_listed_entity(self, monkeypatch):
+        _reset_filter_mirrors(monkeypatch)
+        monkeypatch.setenv("HASS_ENTITY_ALLOWLIST", "climate.*")
+        with patch.object(ha_tool, "_run_async") as run:
+            result = json.loads(_handle_get_state({"entity_id": "sensor.kitchen_temp"}))
+        assert "error" in result
+        assert "HASS_ENTITY_ALLOWLIST" in result["error"]
+        run.assert_not_called()
+
+    def test_denylist_vetoes_allowlisted_entity_on_read(self, monkeypatch):
+        """Consistent with the list path: deny is a final veto."""
+        _reset_filter_mirrors(monkeypatch)
+        monkeypatch.setenv("HASS_ENTITY_ALLOWLIST", "climate.*")
+        monkeypatch.setenv("HASS_ENTITY_DENYLIST", "climate.office_zombie")
+        with patch.object(ha_tool, "_run_async") as run:
+            result = json.loads(_handle_get_state({"entity_id": "climate.office_zombie"}))
+        assert "error" in result
+        assert "HASS_ENTITY_DENYLIST" in result["error"]
+        run.assert_not_called()
+
+    def test_normal_entity_still_reads(self, monkeypatch):
+        """No operator config: a valid entity reaches the fetch layer."""
+        _reset_filter_mirrors(monkeypatch)
+        with patch.object(ha_tool, "_async_get_state", new_callable=AsyncMock) as fetch:
+            fetch.return_value = {"entity_id": "climate.office", "state": "heat"}
+            result = json.loads(_handle_get_state({"entity_id": "climate.office"}))
+        assert result["result"]["entity_id"] == "climate.office"
+        fetch.assert_awaited_once_with("climate.office")
+
+    def test_operator_configured_but_matched_entity_reads(self, monkeypatch):
+        """With a denylist set, an entity that does NOT match it still reads."""
+        _reset_filter_mirrors(monkeypatch)
+        monkeypatch.setenv("HASS_ENTITY_DENYLIST", "office_thermostat_*")
+        with patch.object(ha_tool, "_async_get_state", new_callable=AsyncMock) as fetch:
+            fetch.return_value = {"entity_id": "climate.office", "state": "heat",
+                                  "current_temperature": 28.0}
+            result = json.loads(_handle_get_state({"entity_id": "climate.office"}))
+        assert result["result"]["entity_id"] == "climate.office"
+        fetch.assert_awaited_once_with("climate.office")
+
+    def test_violation_helper_returns_none_when_unset(self, monkeypatch):
+        _reset_filter_mirrors(monkeypatch)
+        assert _operator_filter_violation("sensor.anything") is None
+
+    def test_violation_helper_reports_deny_then_allow(self, monkeypatch):
+        _reset_filter_mirrors(monkeypatch)
+        monkeypatch.setenv("HASS_ENTITY_ALLOWLIST", "climate.*")
+        assert _operator_filter_violation("sensor.x") == "not in HASS_ENTITY_ALLOWLIST"
+        monkeypatch.setenv("HASS_ENTITY_DENYLIST", "office_thermostat_*")
+        assert _operator_filter_violation("office_thermostat.0_valve_position") == (
+            "excluded by HASS_ENTITY_DENYLIST"
+        )

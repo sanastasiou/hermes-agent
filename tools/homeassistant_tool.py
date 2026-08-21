@@ -147,6 +147,25 @@ def _apply_operator_filters(
     return out
 
 
+def _operator_filter_violation(entity_id: str) -> Optional[str]:
+    """Return a human-readable reason an entity is excluded by operator config,
+    or ``None`` if it may be read.
+
+    Shared by the single-entity read path so a denylisted/whitelist-missed
+    entity is refused *before* it is fetched — otherwise an operator who
+    denies ``office_thermostat_*`` to keep it out of lists could still read
+    the frozen zombie value directly and report it as live (the exact
+    28°/22° inconsistency this fix targets). Denylist is a final veto,
+    matching ``_apply_operator_filters``.
+    """
+    allow, deny = _get_entity_filter_config()
+    if deny and _entity_matches(entity_id, deny):
+        return "excluded by HASS_ENTITY_DENYLIST"
+    if allow and not _entity_matches(entity_id, allow):
+        return "not in HASS_ENTITY_ALLOWLIST"
+    return None
+
+
 def _normalize_id_list(value: Any) -> set:
     """Accept a list or a comma/space-delimited string of entity_ids; dedupe."""
     if value is None:
@@ -432,6 +451,13 @@ def _handle_get_state(args: dict, **kw) -> str:
         return tool_error("Missing required parameter: entity_id")
     if not _ENTITY_ID_RE.match(entity_id):
         return tool_error(f"Invalid entity_id format: {entity_id}")
+    violation = _operator_filter_violation(entity_id)
+    if violation:
+        return tool_error(
+            f"{entity_id} is excluded by operator config ({violation}). "
+            "Use ha_list_entities with a filter to discover an alternative "
+            "entity, or ask the operator to adjust the allow/deny lists."
+        )
     try:
         result = _run_async(_async_get_state(entity_id))
         return json.dumps({"result": result})
