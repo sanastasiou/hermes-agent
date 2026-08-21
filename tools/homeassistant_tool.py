@@ -11,10 +11,11 @@ The HA instance URL is read from ``HASS_URL`` (default: http://homeassistant.loc
 """
 
 import asyncio
+import fnmatch
 import json
 import logging
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from agent.secret_scope import get_secret
 
@@ -28,13 +29,135 @@ logger = logging.getLogger(__name__)
 _HASS_URL: str = ""
 _HASS_TOKEN: str = ""
 
+# Operator allow/deny lists for entity filtering (e.g. HASS_ENTITY_DENYLIST).
+# Module-level mirrors so tests can monkeypatch; real values are read from the
+# active profile env at call time via _get_entity_filters().
+_HASS_ENTITY_ALLOWLIST: str = ""
+_HASS_ENTITY_DENYLIST: str = ""
+
+# Default cap on entities returned by an unfiltered (or over-broad)
+# ha_list_entities call. Real HA installs expose thousands of entities; a bare
+# call used to dump all of them into the model context (~135K tokens). Capping
+# the *returned* set keeps the payload bounded while the operator can still
+# pull everything back by passing a higher ``max``.
+DEFAULT_MAX_ENTITIES = 100
+
 
 def _get_config():
     """Return the active profile's Home Assistant URL and token."""
     return (
         (_HASS_URL or get_secret("HASS_URL", "http://homeassistant.local:8123") or "").rstrip("/"),
-        _HASS_TOKEN or get_secret("HASS_TOKEN", "") or "",
+        (_HASS_TOKEN or get_secret("HASS_TOKEN", "") or "").strip(),
     )
+
+
+def _get_entity_filter_config():
+    """Return (allowlist, denylist) entity-filter patterns from the active profile.
+
+    Operators can permanently exclude known-dead entities (e.g. a zombie
+    ``office_thermostat_*`` cluster left behind by a migration) without a code
+    change:
+
+    - ``HASS_ENTITY_DENYLIST`` — comma-separated entity_id prefixes or globs
+      (e.g. ``office_thermostat_*``) to always exclude from ha_list_entities.
+      Acts as a final veto: it wins even against the allowlist.
+    - ``HASS_ENTITY_ALLOWLIST`` — same format; when non-empty it restricts
+      results to matching entities (a whitelist).
+
+    Values come from the profile-scoped env (same resolution as
+    HASS_URL/HASS_TOKEN), with module-level mirrors for test monkeypatching.
+    """
+    allow = (
+        _HASS_ENTITY_ALLOWLIST
+        or (get_secret("HASS_ENTITY_ALLOWLIST", "") or "")
+    )
+    deny = (
+        _HASS_ENTITY_DENYLIST
+        or (get_secret("HASS_ENTITY_DENYLIST", "") or "")
+    )
+    return _parse_entity_filter_patterns(allow), _parse_entity_filter_patterns(deny)
+
+
+def _parse_entity_filter_patterns(value: str) -> List[str]:
+    """Split a comma-separated env value into trimmed, non-empty patterns."""
+    if not value:
+        return []
+    return [p.strip() for p in value.split(",") if p.strip()]
+
+
+def _entity_matches(entity_id: str, patterns: List[str]) -> bool:
+    """Return True if ``entity_id`` matches any operator pattern.
+
+    Matching is deliberately forgiving so an operator can write
+    ``office_thermostat_*`` (the way the device family is usually
+    abbreviated) and have it cover ``office_thermostat.0_external_temperature``
+    (a real HA entity id whose separator after the device name is a dot):
+
+    - exact match
+    - prefix match, treating ``.`` and ``_`` as equivalent at the boundary
+      (``office_thermostat.0_x`` matches ``office_thermostat_*``)
+    - shell-glob match (``*.valve*``, ``climate.office`` etc.)
+    """
+    for pat in patterns:
+        if not pat:
+            continue
+        if entity_id == pat:
+            return True
+        if fnmatch.fnmatch(entity_id, pat):
+            return True
+        # Family-prefix match. A pattern that ends in ``*`` or a separator
+        # (``office_thermostat_*``, ``office_thermostat.``) is a family
+        # prefix: it should cover ``office_thermostat.0_x`` by treating the
+        # separator after the matched base (``.`` or ``_``) as
+        # interchangeable, or the id to end exactly at the base. A bare
+        # id like ``climate.office`` without a trailing separator is only
+        # an exact/glob match, so it does NOT swallow
+        # ``climate.office_zombie``.
+        if pat[-1] in "*._":
+            base = pat.rstrip("*._")
+            if base and entity_id.startswith(base) and (
+                len(entity_id) == len(base) or entity_id[len(base)] in "._"
+            ):
+                return True
+    return False
+
+
+def _apply_operator_filters(
+    states: List[Dict[str, Any]],
+    allow: List[str],
+    deny: List[str],
+) -> List[Dict[str, Any]]:
+    """Apply the operator allow/deny lists (see ``_get_entity_filter_config``).
+
+    The allowlist narrows to a whitelist; the denylist is a final veto, so an
+    entity matching both is excluded. This is the intuitive model for the main
+    use case: an operator writes an allowlist of live climate devices and a
+    denylist of a specific dead one, and the dead one drops out.
+    """
+    if not allow and not deny:
+        return states
+    out = []
+    for s in states:
+        entity_id = s.get("entity_id", "")
+        if allow and not _entity_matches(entity_id, allow):
+            continue  # not on the whitelist
+        if deny and _entity_matches(entity_id, deny):
+            continue  # denylist is a final veto
+        out.append(s)
+    return out
+
+
+def _normalize_id_list(value: Any) -> set:
+    """Accept a list or a comma/space-delimited string of entity_ids; dedupe."""
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        parts = re.split(r"[,\s]+", value.strip())
+    elif isinstance(value, (list, tuple)):
+        parts = [str(p).strip() for p in value]
+    else:
+        parts = [str(value).strip()]
+    return {p for p in parts if p}
 
 # Regex for valid HA entity_id format (e.g. "light.living_room", "sensor.temperature_1")
 _ENTITY_ID_RE = re.compile(r"^[a-z_][a-z0-9_]*\.[a-z0-9_]+$")
@@ -79,35 +202,82 @@ def _filter_and_summarize(
     states: list,
     domain: Optional[str] = None,
     area: Optional[str] = None,
+    entity_ids: Optional[Any] = None,
+    name: Optional[str] = None,
+    max_entities: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Filter raw HA states by domain/area and return a compact summary."""
-    if domain:
-        states = [s for s in states if s.get("entity_id", "").startswith(f"{domain}.")]
+    """Filter raw HA states, then build the compact payload.
 
-    if area:
-        area_lower = area.lower()
-        states = [
-            s for s in states
-            if area_lower in (s.get("attributes", {}).get("friendly_name", "") or "").lower()
-            or area_lower in (s.get("attributes", {}).get("area", "") or "").lower()
-        ]
+    Every filter is applied to the raw state list BEFORE the payload is
+    built, so tokens are never spent on entities that would be dropped:
+
+    1. operator allow/deny lists (HASS_ENTITY_ALLOWLIST / HASS_ENTITY_DENYLIST)
+    2. caller filters: domain, area, name (substring), explicit entity_ids
+    3. the entity cap (``max_entities``, default ``DEFAULT_MAX_ENTITIES``)
+
+    A bare (unfiltered) call therefore returns at most ``DEFAULT_MAX_ENTITIES``
+    entities and reports ``truncated: true`` when more matched — instead of
+    dumping an entire installation (~thousands of entities) into the model.
+    """
+    allow, deny = _get_entity_filter_config()
+    states = _apply_operator_filters(states, allow, deny)
+
+    id_filter = _normalize_id_list(entity_ids)
+    if id_filter:
+        # An explicit entity list is the caller's precise intent — it
+        # supersedes the broader domain/area/name filters (an entity on the
+        # list is returned even if it would not match a co-passed domain).
+        states = [s for s in states if s.get("entity_id", "") in id_filter]
+    else:
+        if domain:
+            states = [s for s in states if s.get("entity_id", "").startswith(f"{domain}.")]
+
+        if area:
+            area_lower = area.lower()
+            states = [
+                s for s in states
+                if area_lower in (s.get("attributes", {}).get("friendly_name", "") or "").lower()
+                or area_lower in (s.get("attributes", {}).get("area", "") or "").lower()
+            ]
+
+        if name:
+            name_lower = name.lower()
+            states = [
+                s for s in states
+                if name_lower in (s.get("attributes", {}).get("friendly_name", "") or "").lower()
+                or name_lower in (s.get("entity_id", "") or "").lower()
+            ]
+
+    cap = max_entities if (isinstance(max_entities, int) and not isinstance(max_entities, bool) and max_entities > 0) else DEFAULT_MAX_ENTITIES
+    truncated = len(states) > cap
 
     entities = []
-    for s in states:
+    for s in states[:cap]:
         entities.append({
             "entity_id": s["entity_id"],
             "state": s["state"],
             "friendly_name": s.get("attributes", {}).get("friendly_name", ""),
         })
 
-    return {"count": len(entities), "entities": entities}
+    result = {"count": len(entities), "entities": entities}
+    if truncated:
+        result["truncated"] = True
+        result["truncated_note"] = (
+            f"Showing first {cap} of {len(states)} matching entities. "
+            "Refine with domain/area/name filters or an explicit entity_ids "
+            "list, or pass a larger max."
+        )
+    return result
 
 
 async def _async_list_entities(
     domain: Optional[str] = None,
     area: Optional[str] = None,
+    entity_ids: Optional[Any] = None,
+    name: Optional[str] = None,
+    max_entities: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Fetch entity states from HA and optionally filter by domain/area."""
+    """Fetch entity states from HA; filters are applied before the payload is built."""
     import aiohttp
 
     hass_url, hass_token = _get_config()
@@ -117,7 +287,14 @@ async def _async_list_entities(
             resp.raise_for_status()
             states = await resp.json()
 
-    return _filter_and_summarize(states, domain, area)
+    return _filter_and_summarize(
+        states,
+        domain=domain,
+        area=area,
+        entity_ids=entity_ids,
+        name=name,
+        max_entities=max_entities,
+    )
 
 
 async def _async_get_state(entity_id: str) -> Dict[str, Any]:
@@ -226,8 +403,22 @@ def _handle_list_entities(args: dict, **kw) -> str:
     """Handler for ha_list_entities tool."""
     domain = args.get("domain")
     area = args.get("area")
+    entity_ids = args.get("entity_ids")
+    name = args.get("name")
+    max_entities = args.get("max")
+    if isinstance(max_entities, str):
+        try:
+            max_entities = int(max_entities)
+        except ValueError:
+            return tool_error(f"Invalid 'max' value: {max_entities!r} (expected a positive integer)")
     try:
-        result = _run_async(_async_list_entities(domain=domain, area=area))
+        result = _run_async(_async_list_entities(
+            domain=domain,
+            area=area,
+            entity_ids=entity_ids,
+            name=name,
+            max_entities=max_entities,
+        ))
         return json.dumps({"result": result})
     except Exception as e:
         logger.error("ha_list_entities error: %s", e)
@@ -354,9 +545,12 @@ def _check_ha_available() -> bool:
 HA_LIST_ENTITIES_SCHEMA = {
     "name": "ha_list_entities",
     "description": (
-        "List Home Assistant entities. Optionally filter by domain "
-        "(light, switch, climate, sensor, binary_sensor, cover, fan, etc.) "
-        "or by area name (living room, kitchen, bedroom, etc.)."
+        "List Home Assistant entity states. ALWAYS pass at least one filter "
+        "(domain, area, name, or an explicit entity_ids list) — an unfiltered "
+        "call returns only the first 100 entities and sets truncated=true, so "
+        "a bare call is only useful for a rough overview. Prefer domain "
+        "(e.g. 'climate', 'sensor') or area/name (e.g. 'kitchen', 'thermostat') "
+        "to keep results small and targeted."
     ),
     "parameters": {
         "type": "object",
@@ -366,14 +560,39 @@ HA_LIST_ENTITIES_SCHEMA = {
                 "description": (
                     "Entity domain to filter by (e.g. 'light', 'switch', 'climate', "
                     "'sensor', 'binary_sensor', 'cover', 'fan', 'media_player'). "
-                    "Omit to list all entities."
+                    "Strongly preferred over an unfiltered call."
                 ),
             },
             "area": {
                 "type": "string",
                 "description": (
                     "Area/room name to filter by (e.g. 'living room', 'kitchen'). "
-                    "Matches against entity friendly names. Omit to list all."
+                    "Matches against entity friendly names and area attribute."
+                ),
+            },
+            "name": {
+                "type": "string",
+                "description": (
+                    "Substring to match against entity friendly names and "
+                    "entity_ids (e.g. 'thermostat', 'temperature'). "
+                    "Useful when you don't know the domain."
+                ),
+            },
+            "entity_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Exact list of entity_ids to fetch (e.g. "
+                    "['climate.office', 'sensor.office_temp']). Returns just "
+                    "these entities, ignoring the domain/area/name filters."
+                ),
+            },
+            "max": {
+                "type": "integer",
+                "description": (
+                    "Maximum number of entities to return (default 100). "
+                    "Set higher (e.g. 500) only if you genuinely need a "
+                    "larger batch and the query is already well filtered."
                 ),
             },
         },
